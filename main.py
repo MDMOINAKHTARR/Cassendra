@@ -1,12 +1,55 @@
 import os
 import json
-import random
-from typing import TypedDict, List, Literal
+import asyncio
+from typing import TypedDict, List
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.messages import HumanMessage
+import re
 
 # Load environment variables
 load_dotenv()
+
+# --- ANSI Color Codes for Terminal ---
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+
+def print_banner():
+    """Print ASCII art banner"""
+    banner = f"""
+{Colors.CYAN}{Colors.BOLD}╔═══════════════════════════════════════════════════════════════╗
+║                                                               ║
+║   ██████╗ █████╗ ███████╗███████╗ █████╗ ███╗   ██╗██████╗   ║
+║  ██╔════╝██╔══██╗██╔════╝██╔════╝██╔══██╗████╗  ██║██╔══██╗  ║
+║  ██║     ███████║███████╗███████╗███████║██╔██╗ ██║██║  ██║  ║
+║  ██║     ██╔══██║╚════██║╚════██║██╔══██║██║╚██╗██║██║  ██║  ║
+║  ╚██████╗██║  ██║███████║███████║██║  ██║██║ ╚████║██████╔╝  ║
+║   ╚═════╝╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═══╝╚═════╝   ║
+║                                                               ║
+║         Autonomous OSINT Verification Engine                 ║
+║              Terminal-Based Truth Detector                    ║
+╚═══════════════════════════════════════════════════════════════╝{Colors.ENDC}
+"""
+    print(banner)
+
+def print_section(title, color=Colors.CYAN):
+    """Print a section header"""
+    print(f"\n{color}{Colors.BOLD}{'='*70}")
+    print(f"  {title}")
+    print(f"{'='*70}{Colors.ENDC}\n")
+
+def print_agent_status(agent_name, status, color=Colors.BLUE):
+    """Print agent status update"""
+    print(f"{color}{Colors.BOLD}[{agent_name}]{Colors.ENDC} {status}")
 
 # --- State Definition ---
 class AgentState(TypedDict):
@@ -19,13 +62,8 @@ class AgentState(TypedDict):
     kill_score: int
     status: str
 
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.messages import HumanMessage, SystemMessage
-
-import re
-import json
-
 def extract_json(text):
+    """Extract JSON from LLM response"""
     try:
         # Find JSON block
         match = re.search(r"\{.*\}", text, re.DOTALL)
@@ -36,18 +74,27 @@ def extract_json(text):
         return {}
 
 # --- Agent 1: The Journalist (Builder) ---
-def journalist_node(state: AgentState):
-    print(f"\n[JOURNALIST] Researching claim: '{state['claim']}'")
+async def journalist_node(state: AgentState):
+    """Research the claim and formulate hypothesis"""
+    print_section("🔍 JOURNALIST - RESEARCH PHASE", Colors.BLUE)
+    print_agent_status("JOURNALIST", f"Researching claim: '{state['claim']}'", Colors.BLUE)
     
     try:
         from tavily import TavilyClient
         tavily = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+        
+        print_agent_status("JOURNALIST", "Searching the web for evidence...", Colors.BLUE)
         response = tavily.search(query=state['claim'], search_depth="advanced", max_results=5)
         
         sources = [result['url'] for result in response['results']]
         context = "\n".join([r['content'] for r in response['results']])
         
+        print_agent_status("JOURNALIST", f"Found {len(sources)} sources", Colors.BLUE)
+        for i, source in enumerate(sources, 1):
+            print(f"  {Colors.CYAN}[{i}]{Colors.ENDC} {source[:80]}...")
+        
         # Use Gemini to generate a hypothesis
+        print_agent_status("JOURNALIST", "Analyzing evidence with AI...", Colors.BLUE)
         llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=os.getenv("GOOGLE_API_KEY"))
         prompt = f"""
         You are a Journalist. Analyze these search results about the claim: "{state['claim']}".
@@ -70,14 +117,13 @@ def journalist_node(state: AgentState):
         confidence = data.get("confidence", 0)
             
     except Exception as e:
-        print(f"[JOURNALIST] Error: {e}")
+        print(f"{Colors.RED}[ERROR]{Colors.ENDC} {e}")
         hypothesis = f"Error during research: {e}"
         sources = []
         confidence = 0
     
-    print(f"[JOURNALIST] Hypothesis: {hypothesis}")
-    print(f"[JOURNALIST] Confidence: {confidence}")
-    print(f"[JOURNALIST] Sources: {sources}")
+    print(f"\n{Colors.GREEN}{Colors.BOLD}HYPOTHESIS:{Colors.ENDC} {hypothesis}")
+    print(f"{Colors.YELLOW}CONFIDENCE:{Colors.ENDC} {confidence}%")
     
     return {
         "hypothesis": hypothesis,
@@ -87,8 +133,10 @@ def journalist_node(state: AgentState):
     }
 
 # --- Agent 2: The Editor (Skeptic) ---
-def editor_node(state: AgentState):
-    print(f"\n[EDITOR] Auditing hypothesis: '{state['hypothesis']}'")
+async def editor_node(state: AgentState):
+    """Audit the hypothesis and look for contradictions"""
+    print_section("⚡ EDITOR - SKEPTICAL AUDIT", Colors.YELLOW)
+    print_agent_status("EDITOR", f"Auditing hypothesis...", Colors.YELLOW)
     
     try:
         llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", google_api_key=os.getenv("GOOGLE_API_KEY"))
@@ -108,6 +156,7 @@ def editor_node(state: AgentState):
         Output format: JSON {{ "contradiction_found": bool, "evidence": "string", "kill_score": int }}
         """
         
+        print_agent_status("EDITOR", "Running adversarial analysis...", Colors.YELLOW)
         msg = HumanMessage(content=prompt)
         ai_msg = llm.invoke([msg])
         
@@ -118,13 +167,13 @@ def editor_node(state: AgentState):
         kill_score = data.get("kill_score", 0)
         
     except Exception as e:
-        print(f"[EDITOR] Error: {e}")
+        print(f"{Colors.RED}[ERROR]{Colors.ENDC} {e}")
         contradiction = False
         evidence = f"Error during audit: {e}"
         kill_score = 0
-        
-    print(f"[EDITOR] Evidence: {evidence}")
-    print(f"[EDITOR] Kill Score: {kill_score}/100")
+    
+    print(f"\n{Colors.BOLD}AUDIT EVIDENCE:{Colors.ENDC} {evidence}")
+    print(f"{Colors.RED if kill_score > 50 else Colors.GREEN}KILL SCORE:{Colors.ENDC} {kill_score}/100")
     
     return {
         "contradiction_found": contradiction,
@@ -133,67 +182,63 @@ def editor_node(state: AgentState):
         "status": "audited"
     }
 
-from neo4j import GraphDatabase
-
-# --- Agent 3: The Archivist (Visualizer) ---
-def archivist_node(state: AgentState):
-    print(f"\n[ARCHIVIST] Updating Truth Graph...")
+# --- Agent 3: The Archivist (Database) ---
+async def archivist_node(state: AgentState):
+    """Archive findings to Neo4j Truth Graph"""
+    print_section("📊 ARCHIVIST - TRUTH GRAPH UPDATE", Colors.CYAN)
+    print_agent_status("ARCHIVIST", "Updating Truth Graph database...", Colors.CYAN)
     
     uri = os.getenv("NEO4J_URI")
     user = os.getenv("NEO4J_USERNAME", "neo4j")
     password = os.getenv("NEO4J_PASSWORD")
     
     if not password or "xxxx" in password:
-        print("[ARCHIVIST] WARNING: Neo4j password not set. Skipping DB update.")
-        return {"status": "skipped_db"}
+        print(f"{Colors.YELLOW}[WARNING]{Colors.ENDC} Neo4j password not configured. Skipping database update.")
+        print(f"{Colors.CYAN}[INFO]{Colors.ENDC} Configure NEO4J_URI, NEO4J_USERNAME, and NEO4J_PASSWORD in .env to enable graph storage.")
+        final_status = "DEBUNKED" if state.get('contradiction_found') else "VERIFIED"
+    else:
+        try:
+            from neo4j import GraphDatabase
+            driver = GraphDatabase.driver(uri, auth=(user, password))
+            
+            def update_graph(tx, state):
+                # Create Claim Node
+                tx.run("MERGE (c:Claim {text: $claim}) SET c.status = 'VERIFYING'", claim=state['claim'])
+                
+                # Create Source Nodes
+                for source in state['sources']:
+                    tx.run("""
+                        MATCH (c:Claim {text: $claim})
+                        MERGE (s:Source {url: $url})
+                        MERGE (s)-[:SUPPORTS]->(c)
+                    """, claim=state['claim'], url=source)
+                
+                # Handle Contradiction
+                if state['contradiction_found']:
+                    tx.run("""
+                        MATCH (c:Claim {text: $claim})
+                        SET c.status = 'DEBUNKED', c.color = '#ff0000'
+                        MERGE (e:Evidence {text: $evidence})
+                        MERGE (e)-[:CONTRADICTS]->(c)
+                    """, claim=state['claim'], evidence=state['evidence'])
+                else:
+                    tx.run("""
+                        MATCH (c:Claim {text: $claim})
+                        SET c.status = 'VERIFIED', c.color = '#00ff00'
+                    """, claim=state['claim'])
 
-    try:
-        driver = GraphDatabase.driver(uri, auth=(user, password))
-        
-        def update_graph(tx, state):
-            # Create Claim Node
-            tx.run("MERGE (c:Claim {text: $claim}) SET c.status = 'VERIFYING'", claim=state['claim'])
+            with driver.session() as session:
+                session.execute_write(update_graph, state)
+                
+            driver.close()
+            final_status = "DEBUNKED" if state['contradiction_found'] else "VERIFIED"
+            print_agent_status("ARCHIVIST", f"Graph updated successfully - Status: {final_status}", Colors.GREEN)
             
-            # Create Source Nodes
-            for source in state['sources']:
-                tx.run("""
-                    MATCH (c:Claim {text: $claim})
-                    MERGE (s:Source {url: $url})
-                    MERGE (s)-[:SUPPORTS]->(c)
-                """, claim=state['claim'], url=source)
-            
-            # Handle Contradiction
-            if state['contradiction_found']:
-                tx.run("""
-                    MATCH (c:Claim {text: $claim})
-                    SET c.status = 'DEBUNKED', c.color = '#ff0000'
-                    MERGE (e:Evidence {text: $evidence})
-                    MERGE (e)-[:CONTRADICTS]->(c)
-                """, claim=state['claim'], evidence=state['evidence'])
-                print(f"[ARCHIVIST] MARKED CLAIM AS DEBUNKED (RED NODE).")
-            else:
-                tx.run("""
-                    MATCH (c:Claim {text: $claim})
-                    SET c.status = 'VERIFIED', c.color = '#00ff00'
-                """, claim=state['claim'])
-                print(f"[ARCHIVIST] MARKED CLAIM AS VERIFIED (GREEN NODE).")
-
-        with driver.session() as session:
-            session.execute_write(update_graph, state)
-            
-        driver.close()
-        final_status = "DEBUNKED" if state['contradiction_found'] else "VERIFIED"
-        
-    except Exception as e:
-        print(f"[ARCHIVIST] Error updating Neo4j: {e}")
-        final_status = "error"
+        except Exception as e:
+            print(f"{Colors.RED}[ERROR]{Colors.ENDC} Neo4j error: {e}")
+            final_status = "error"
     
     return {"status": final_status}
-
-# --- Decision Logic ---
-def should_continue(state: AgentState) -> Literal["archivist"]:
-    # In this simple flow, we always go to the archivist after the editor
-    return "archivist"
 
 # --- Workflow Construction ---
 workflow = StateGraph(AgentState)
@@ -208,22 +253,66 @@ workflow.add_edge("journalist", "editor")
 workflow.add_edge("editor", "archivist")
 workflow.add_edge("archivist", END)
 
-app = workflow.compile()
+graph_app = workflow.compile()
 
-# --- Execution ---
+# --- Main CLI Function ---
+async def verify_claim(claim: str):
+    """Run the verification workflow for a given claim"""
+    initial_input = {"claim": claim, "status": "new"}
+    
+    print_section("🚀 VERIFICATION WORKFLOW STARTED", Colors.GREEN)
+    print(f"{Colors.BOLD}CLAIM:{Colors.ENDC} {claim}\n")
+    
+    final_state = {}
+    async for output in graph_app.astream(initial_input):
+        # Store final state from each node
+        for node_name, node_output in output.items():
+            final_state.update(node_output)
+    
+    # Print final verdict
+    print_section("✅ VERIFICATION COMPLETE", Colors.GREEN)
+    
+    verdict = "DEBUNKED" if final_state.get('contradiction_found') else "VERIFIED"
+    verdict_color = Colors.RED if verdict == "DEBUNKED" else Colors.GREEN
+    
+    print(f"{Colors.BOLD}FINAL VERDICT:{Colors.ENDC} {verdict_color}{verdict}{Colors.ENDC}")
+    print(f"{Colors.BOLD}CONFIDENCE:{Colors.ENDC} {final_state.get('confidence', 0)}%")
+    print(f"{Colors.BOLD}KILL SCORE:{Colors.ENDC} {final_state.get('kill_score', 0)}/100")
+    
+    if final_state.get('sources'):
+        print(f"\n{Colors.BOLD}SOURCES ({len(final_state['sources'])}):{Colors.ENDC}")
+        for i, source in enumerate(final_state['sources'], 1):
+            print(f"  [{i}] {source}")
+    
+    print(f"\n{Colors.CYAN}{'='*70}{Colors.ENDC}\n")
+
+# --- Main Entry Point ---
 if __name__ == "__main__":
-    print("\n--- CASSANDRA: Autonomous OSINT Verification Engine ---")
-    print("Enter a rumor, news headline, or claim to verify.")
-    user_claim = input(">>> Claim: ")
+    print_banner()
     
-    if not user_claim.strip():
-        print("No claim entered. Exiting.")
-        exit()
-
-    initial_input = {"claim": user_claim, "status": "new"}
+    print(f"{Colors.BOLD}The CASSANDRA Engine{Colors.ENDC} uses a multi-agent adversarial system:")
+    print(f"  {Colors.BLUE}• Journalist{Colors.ENDC} - Researches and builds hypothesis")
+    print(f"  {Colors.YELLOW}• Editor{Colors.ENDC} - Skeptically audits for contradictions")
+    print(f"  {Colors.CYAN}• Archivist{Colors.ENDC} - Archives findings to Truth Graph")
     
-    print(f"\n[ORCHESTRATOR] Spawning agents for: '{user_claim}'...\n")
-    for output in app.stream(initial_input):
-        pass
-    print("\n--- VERIFICATION COMPLETE ---")
-    print("Check your Neo4j Dashboard for the Truth Graph.")
+    print(f"\n{Colors.GREEN}Enter a claim, rumor, or news headline to verify.{Colors.ENDC}")
+    print(f"{Colors.YELLOW}Press Ctrl+C to exit.{Colors.ENDC}\n")
+    
+    try:
+        while True:
+            user_claim = input(f"{Colors.BOLD}{Colors.CYAN}>>> CLAIM: {Colors.ENDC}").strip()
+            
+            if not user_claim:
+                print(f"{Colors.YELLOW}[!] No claim entered. Please enter a claim.{Colors.ENDC}\n")
+                continue
+            
+            # Run verification
+            asyncio.run(verify_claim(user_claim))
+            
+            print(f"\n{Colors.GREEN}Ready for next claim...{Colors.ENDC}\n")
+            
+    except KeyboardInterrupt:
+        print(f"\n\n{Colors.CYAN}{'='*70}")
+        print(f"  Thank you for using CASSANDRA!")
+        print(f"  Truth Graph preserved in Neo4j database.")
+        print(f"{'='*70}{Colors.ENDC}\n")
